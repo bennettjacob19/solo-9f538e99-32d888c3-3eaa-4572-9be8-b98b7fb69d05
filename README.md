@@ -5,6 +5,9 @@
 每条带每盘 4 KiB。`/docs` 里可以按块读写，并能模拟"数据块已落盘而校验块未落盘"或
 相反方向的掉电；重启时指定任一数据盘离线，阵列进入只读降级模式。
 
+阵列同时充当归档采集程序的暂存区：健康模式下可以按条带号一次读出两个数据块和该
+条带的版本，归档完成后凭这个版本清空同一条带（见"条带版本与凭版本清空"）。
+
 ## 快速开始
 
 ```bash
@@ -12,8 +15,9 @@ docker compose up --build
 # 打开 http://localhost:8000/docs
 ```
 
-数据保存在 compose 命名卷 `array-data` 中，`docker compose down && docker compose up`
-之后仍在。默认 16 条带（每盘 64 KiB），可用环境变量调整：
+数据保存在 compose 命名卷 `array-data` 中（三块盘镜像、`journal.img`、
+`versions.img`），`docker compose down && docker compose up` 之后仍在。
+默认 16 条带（每盘 64 KiB），可用环境变量调整：
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
@@ -40,10 +44,13 @@ DATA_DIR=./data uvicorn app.main:app --reload
 | `GET` | `/api/disks/{disk}/blocks/{index}` | 读一个 4 KiB 块（base64 + SHA-256） |
 | `POST` / `PUT` | `/api/disks/{disk}/blocks/{index}` | 写一个 4 KiB 块（JSON 或 `application/octet-stream`） |
 | `POST` | `/api/write` | 同上，参数全部放在 JSON body |
+| `GET` | `/api/stripes/{index}` | 一次读出一个条带的两个数据块和当前版本 |
+| `POST` | `/api/stripes/{index}/clear` | 凭版本清空整个条带（两个数据块 + 校验块一起清零） |
+| `GET` | `/api/versions` | 所有条带的版本与版本文件的占用 |
 | `GET` | `/api/disks/{disk}/blocks/{index}/raw` | 读原始字节 |
 | `GET` | `/healthz` | 存活探针；模拟掉电后返回 503 |
 
-写入的 `power_loss` 取值：
+写入和清空都支持 `power_loss` 掉电选项：
 
 | 值 | 效果 |
 | --- | --- |
@@ -85,6 +92,30 @@ stripe i:  parity[i] = data0[i] XOR data1[i]        (偏移 i * 4096)
   被中断的写入整体视为旧值，仍满足"旧值或新值"的约束。
 * 日志负载校验失败或日志头状态字节非法 → 拒绝启动（`VolumeCorrupt`），不猜测数据。
 
+## 条带版本与凭版本清空（归档采集）
+
+采集程序的典型流程：
+
+1. `GET /api/stripes/{index}` 一次读出该条带的 `data0`、`data1` 两个数据块和
+   当前 `version`；
+2. 数据归档完成后，`POST /api/stripes/{index}/clear`，body 为
+   `{"version": <读到的版本>}`；
+3. 版本匹配 → 同一条带的两个数据块和校验块一起清零，该条带版本更新；
+   版本不匹配 → 409 `version_conflict`，原数据保留。
+
+版本语义：
+
+* 每次生效的写入或清空都会把该条带的版本更新为本次操作的日志序列号 ——
+  包括同值覆盖（字节没变版本也会变）和掉电后由恢复重放的写入；
+* 写别的条带、正常重启都不影响该条带的版本；
+* 清空同样支持 `power_loss` 掉电选项。清空中断后用原卷重启，条带内容和版本
+  要么都保持原样（日志意图没落盘），要么都切到清空后的状态，不会只变一半 ——
+  版本在日志清除之前落盘，恢复重放时按同一序列号幂等赋值。
+
+版本持久化在 `versions.img`：每条带一个 8 字节小端计数器，文件大小恒为
+`条带数 × 8 B`，只随条带数增长，不随操作次数增长。盘镜像与日志格式不变；
+旧卷没有该文件，首次启动时按全 0 创建（所有条带版本为 0）。
+
 ## 降级模式
 
 `OFFLINE_DISK=data0|data1`（或等价别名 `0`/`1`）启动时：
@@ -108,7 +139,7 @@ stripe i:  parity[i] = data0[i] XOR data1[i]        (偏移 i * 4096)
 | HTTP | code |
 | --- | --- |
 | 404 | `block_out_of_range` |
-| 409 | `degraded_read_only` |
+| 409 | `degraded_read_only` / `version_conflict` |
 | 422 | `invalid_configuration` / `invalid_block_payload` |
 | 503 | `simulated_power_loss` / `service_crashed` |
 | 500 | `volume_corrupt` |
@@ -123,9 +154,12 @@ python scripts/drill.py   # 真实 uvicorn 子进程的四阶段演练
 
 `scripts/drill.py` 会：健康写入 → 模拟"数据块已落盘、校验块未落盘"掉电并把进程
 SIGKILL → 指定 `data1` 离线重启两次（比对两次逻辑视图逐字节一致、只读、
-离线盘读到重建值）→ 恢复健康重启并校验。它自己创建临时数据目录，不会碰
-`./data`。
+离线盘读到重建值）→ 恢复健康重启并校验 → 演练采集流程（同值覆盖抬版本、
+`power_loss=parity` 的清空中断、恢复后版本与内容一起到位、旧版本清空被拒）。
+它自己创建临时数据目录，不会碰 `./data`。
 
 测试覆盖：健康读写与 XOR 校验、六种掉电场景的恢复收敛、降级只读与重建读、
 连续两次降级重启幂等、日志头撕裂、日志负载损坏拒启、日志占用上限、
-缺盘重建、并发写后逐条带校验。
+缺盘重建、并发写后逐条带校验，以及版本化条带：凭版本清空、409 保留原数据、
+同值覆盖抬版本、清空中断后内容与版本一起收敛、版本文件只随条带数增长、
+旧卷（无 `versions.img`）兼容启动。

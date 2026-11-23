@@ -6,6 +6,9 @@ hand from ``/docs``:
 * ``GET  /api/disks/{disk}/blocks/{index}``  -> read one 4 KiB block
 * ``POST /api/disks/{disk}/blocks/{index}``  -> write one 4 KiB block
 * ``POST /api/write``                        -> same, with a JSON body
+* ``GET  /api/stripes/{index}``              -> read both data blocks + version
+* ``POST /api/stripes/{index}/clear``        -> compare-and-clear a whole stripe
+* ``GET  /api/versions``                     -> every stripe's version
 * ``GET  /api/status`` / ``GET /api/journal`` -> inspect degraded + journal state
 
 All storage calls are synchronous (``pread``/``pwrite``/``fsync``), so they are
@@ -41,6 +44,16 @@ _write_description = (
     "`neither` persists only the journal, and `both` lands everything but never "
     "clears the journal. A simulated power loss stops the service; restart it "
     "to run recovery."
+)
+
+_clear_description = (
+    "Zero a whole stripe (both data blocks and the parity block) if and only "
+    "if `version` equals the stripe's current version, as returned by "
+    "`GET /api/stripes/{index}`. A mismatch returns 409 and keeps the data. "
+    "A successful clear bumps the stripe's version. `power_loss` simulates a "
+    "crash mid-clear with the same options as writes; after a restart with "
+    "the same volume the stripe's content and version are either both "
+    "unchanged or both switched to the cleared state."
 )
 
 
@@ -81,6 +94,29 @@ class WriteRequest(BaseModel):
         le=255,
         description="Alternative to data: fill every byte with this value",
         examples=[90],
+    )
+    power_loss: str = Field(
+        "none",
+        description=f"One of: {', '.join(POWER_LOSS_SCENARIOS)}",
+        examples=["none"],
+    )
+
+
+class ClearRequest(BaseModel):
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {"version": 3, "power_loss": "none"},
+                {"version": 3, "power_loss": "parity"},
+            ]
+        }
+    }
+
+    version: int = Field(
+        ...,
+        ge=0,
+        description="Stripe version as returned by GET /api/stripes/{index}",
+        examples=[3],
     )
     power_loss: str = Field(
         "none",
@@ -306,6 +342,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             _decode_block(payload),
             power_loss=payload.power_loss,
         )
+
+    # --------------------------------------------------------------- stripes
+
+    @app.get("/api/stripes/{index}", tags=["stripes"])
+    async def read_stripe(request: Request, index: int) -> dict[str, Any]:
+        return await call(request, arr(request).read_stripe, index)
+
+    @app.post(
+        "/api/stripes/{index}/clear",
+        tags=["stripes"],
+        description=_clear_description,
+        responses={409: {"description": "Version conflict or degraded read-only"}},
+    )
+    async def clear_stripe(
+        request: Request,
+        index: int,
+        power_loss: str | None = Query(
+            None, description=f"One of: {', '.join(POWER_LOSS_SCENARIOS)}"
+        ),
+    ) -> dict[str, Any]:
+        try:
+            body = await request.json()
+        except Exception as exc:
+            raise InvalidBlockPayload(f"invalid clear payload: {exc}") from exc
+        try:
+            payload = ClearRequest.model_validate(body)
+        except Exception as exc:  # pydantic ValidationError
+            raise InvalidBlockPayload(f"invalid clear payload: {exc}") from exc
+        return await call(
+            request,
+            arr(request).clear_stripe,
+            index,
+            expected_version=payload.version,
+            power_loss=power_loss or payload.power_loss,
+        )
+
+    @app.get("/api/versions", tags=["stripes"])
+    async def versions(request: Request) -> dict[str, Any]:
+        return await call(request, arr(request).versions_info)
 
     return app
 

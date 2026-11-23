@@ -7,7 +7,9 @@ It creates a throwaway data directory, starts the service, writes confirmed
 data, crashes mid-write (data blocks landed, parity stale), kills the process,
 restarts with a data disk offline, checks the reconstructed view and read-only
 mode, restarts twice more to prove idempotence, then restarts healthy and
-verifies the array — printing every assertion along the way.
+verifies the array — printing every assertion along the way.  A final section
+exercises the archival collector flow: versioned stripe reads, a same-value
+overwrite, an interrupted clear, and the stale-version 409.
 
 For the Docker variant, follow the same steps by hand in ``/docs`` or use
 ``docker compose up`` with ``OFFLINE_DISK``; see README.
@@ -15,6 +17,7 @@ For the Docker variant, follow the same steps by hand in ``/docs`` or use
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -209,6 +212,76 @@ def main() -> None:
             ok(status["last_recovery"]["recovered"], "recovery reported")
             ok(srv.get("/api/verify")[1]["consistent"], "array verifies")
             ok(srv.snapshot() == degraded_view, "final bytes match the degraded view")
+
+        print("\nphase 5: versioned stripe read and same-value overwrite")
+        zero_sha = hashlib.sha256(bytes(BLOCK)).hexdigest()
+        with Server(data_dir) as srv:
+            status, stripe = srv.get("/api/stripes/3")
+            ok(status == 200, "read stripe 3 (both data blocks + version) in one call")
+            ok(stripe["version"] == 0, "stripe 3 never touched: version 0")
+            ok(stripe["data0"]["sha256"] == zero_sha, "stripe 3 starts zeroed")
+            status, first = srv.request(
+                "POST", "/api/write", {"index": 3, "disk": "data0", "fill": 0x5A}
+            )
+            ok(status == 200, "first write to stripe 3")
+            status, second = srv.request(
+                "POST", "/api/write", {"index": 3, "disk": "data0", "fill": 0x5A}
+            )
+            ok(status == 200, "same-value overwrite of stripe 3")
+            ok(
+                second["version"] > first["version"],
+                "same-value overwrite bumped the version",
+            )
+            status, after = srv.get("/api/stripes/3")
+            ok(
+                after["data0"]["sha256"] == first["stripe_sha256"]["data0"],
+                "bytes unchanged by the same-value overwrite",
+            )
+            ok(after["version"] == second["version"], "stripe read reports new version")
+
+        print("\nphase 6: interrupted clear converges content and version")
+        with Server(data_dir) as srv:
+            version = after["version"]
+            status, body = srv.request(
+                "POST",
+                "/api/stripes/3/clear",
+                {"version": version, "power_loss": "parity"},
+            )
+            ok(status == 503, "clear interrupted by simulated power loss")
+            ok(body["error"]["operation"] == "clear", "crash reported for the clear")
+        with Server(data_dir) as srv:
+            status, stripe = srv.get("/api/stripes/3")
+            ok(
+                stripe["data0"]["sha256"] == zero_sha
+                and stripe["data1"]["sha256"] == zero_sha,
+                "recovery zeroed both data blocks",
+            )
+            ok(srv.block_hash(3, "parity") == zero_sha, "recovery zeroed parity")
+            ok(
+                stripe["version"] == version + 1,
+                "replayed clear bumped the version exactly once",
+            )
+            status, body = srv.request(
+                "POST", "/api/stripes/3/clear", {"version": version}
+            )
+            ok(
+                status == 409 and body["error"]["code"] == "version_conflict",
+                "stale version rejected with 409, data kept",
+            )
+            ok(
+                srv.get("/api/stripes/3")[1]["data0"]["sha256"] == zero_sha,
+                "rejected clear left the stripe untouched",
+            )
+            ok(srv.get("/api/verify")[1]["consistent"], "array verifies")
+
+        print("\nphase 7: clean restart keeps versions")
+        with Server(data_dir) as srv:
+            status, stripe = srv.get("/api/stripes/3")
+            ok(stripe["version"] == version + 1, "version unchanged across restart")
+            ok(
+                (data_dir / "versions.img").stat().st_size == 4 * 8,
+                "versions.img is stripes * 8 bytes",
+            )
 
     print("\nall drill phases passed")
 

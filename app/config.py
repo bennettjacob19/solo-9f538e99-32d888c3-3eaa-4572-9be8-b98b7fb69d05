@@ -10,6 +10,7 @@ BLOCK_SIZE = 4096
 DISK_NAMES: tuple[str, str, str] = ("data0", "data1", "parity")
 DATA_DISKS: tuple[str, str] = ("data0", "data1")
 JOURNAL_NAME = "journal.img"
+VERSIONS_NAME = "versions.img"
 
 _DISK_ALIASES = {
     "0": "data0",
@@ -109,6 +110,10 @@ class Settings:
     @property
     def journal_path(self) -> Path:
         return Path(self.data_dir) / JOURNAL_NAME
+
+    @property
+    def versions_path(self) -> Path:
+        return Path(self.data_dir) / VERSIONS_NAME
 
     @classmethod
     def from_env(cls) -> "Settings":
