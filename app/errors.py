@@ -40,6 +40,11 @@ class DegradedReadOnly(ArrayError):
     code = "degraded_read_only"
 
 
+class VersionConflict(ArrayError):
+    status_code = 409
+    code = "version_conflict"
+
+
 class ServiceCrashed(ArrayError):
     status_code = 503
     code = "service_crashed"

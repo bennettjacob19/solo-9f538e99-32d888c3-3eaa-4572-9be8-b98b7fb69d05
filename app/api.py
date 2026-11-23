@@ -89,6 +89,36 @@ class WriteRequest(BaseModel):
     )
 
 
+class ClearRequest(BaseModel):
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {"expected_version": 3, "power_loss": "none"},
+                {"expected_version": 3, "power_loss": "data"},
+            ]
+        }
+    }
+
+    expected_version: int = Field(
+        ...,
+        ge=0,
+        description="Version previously read from GET /api/stripes/{index}",
+        examples=[3],
+    )
+    power_loss: str = Field(
+        "none",
+        description=f"One of: {', '.join(POWER_LOSS_SCENARIOS)}",
+        examples=["none"],
+    )
+
+
+def _parse_clear(payload: Any) -> ClearRequest:
+    try:
+        return ClearRequest.model_validate(payload)
+    except Exception as exc:  # pydantic ValidationError and JSON decode errors
+        raise InvalidBlockPayload(f"invalid clear payload: {exc}") from exc
+
+
 def _decode_block(payload: WriteRequest) -> bytes:
     provided = [
         payload.data_b64 is not None,
@@ -134,10 +164,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="XOR Array Drill",
-        version="1.0.0",
+        version="1.1.0",
         description=(
             "Three-disk XOR array (data0, data1, parity) with 4 KiB blocks, a "
-            "single-slot redo journal and power-loss simulation. Restart with "
+            "single-slot redo journal and power-loss simulation. Stripes carry "
+            "a version: read both data blocks plus the version in one call, "
+            "then clear the stripe conditional on that version. Restart with "
             "`OFFLINE_DISK=data0` or `OFFLINE_DISK=data1` for read-only "
             "degraded mode."
         ),
@@ -305,6 +337,54 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             payload.disk,
             _decode_block(payload),
             power_loss=payload.power_loss,
+        )
+
+    # ---------------------------------------------------------------- stripes
+
+    _clear_description = (
+        "Zero both data blocks and the parity block of a stripe, but only if "
+        "`expected_version` still matches the stripe's current version "
+        "(compare-and-swap for the archive workflow). A mismatch returns 409 "
+        "`version_conflict` and leaves the data untouched. A committed clear "
+        "advances the stripe version like any write. `power_loss` simulates a "
+        "crash mid-clear; after a restart the stripe content and version are "
+        "either both unchanged or both in the cleared state."
+    )
+
+    @app.get("/api/stripes", tags=["stripes"])
+    async def list_stripes(request: Request) -> dict[str, Any]:
+        return await call(request, arr(request).list_stripes)
+
+    @app.get("/api/stripes/{index}", tags=["stripes"])
+    async def read_stripe(request: Request, index: int) -> dict[str, Any]:
+        return await call(request, arr(request).read_stripe, index)
+
+    @app.post(
+        "/api/stripes/{index}/clear",
+        tags=["stripes"],
+        description=_clear_description,
+        responses={
+            409: {"description": "Version mismatch or degraded read-only mode"}
+        },
+    )
+    async def clear_stripe(
+        request: Request,
+        index: int,
+        power_loss: str | None = Query(
+            None, description=f"One of: {', '.join(POWER_LOSS_SCENARIOS)}"
+        ),
+    ) -> dict[str, Any]:
+        try:
+            body = await request.json()
+        except Exception as exc:
+            raise InvalidBlockPayload(f"invalid clear payload: {exc}") from exc
+        payload = _parse_clear(body)
+        return await call(
+            request,
+            arr(request).clear_stripe,
+            index,
+            payload.expected_version,
+            power_loss=power_loss or payload.power_loss,
         )
 
     return app

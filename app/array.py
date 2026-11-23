@@ -35,9 +35,11 @@ from .errors import (
     InvalidConfiguration,
     ServiceCrashed,
     SimulatedPowerLoss,
+    VersionConflict,
     VolumeCorrupt,
 )
 from .journal import Journal, JournalRecord, new_record
+from .versions import VersionStore
 
 ZERO_BLOCK = bytes(BLOCK_SIZE)
 POWER_LOSS_SCENARIOS = ("none", "data", "data0", "data1", "parity", "neither", "both")
@@ -74,6 +76,9 @@ class XorArray:
                 },
             )
         self._ensure_disks()
+        self.versions = VersionStore(
+            settings.versions_path, settings.stripes, fsync=settings.fsync
+        )
         self._seq = 0
         self._recover()
 
@@ -197,6 +202,11 @@ class XorArray:
         self._write_raw("parity", record.stripe, record.parity)
         applied.append("parity")
 
+        # A replayed write is a committed write: the stripe version advances
+        # exactly once (idempotent on the journal sequence), even when the
+        # journal is kept for an offline disk and replayed again later.
+        version = self.versions.apply(record.stripe, record.seq)
+
         cleared = self.offline is None
         if cleared:
             self.journal.clear(record.seq)
@@ -208,6 +218,7 @@ class XorArray:
             "applied_to": applied,
             "journal_cleared": cleared,
             "pending_offline_disk": self.offline,
+            "version": version,
             "data0_sha256": sha256_hex(record.data0),
             "data1_sha256": sha256_hex(record.data1),
             "parity_sha256": sha256_hex(record.parity),
@@ -292,6 +303,15 @@ class XorArray:
 
     # --------------------------------------------------------------- commands
 
+    def _read_logical(self, name: str, index: int) -> tuple[bytes, str]:
+        """Read a block's logical content, reconstructing the offline disk."""
+
+        if name == self.offline:
+            other = "data1" if name == "data0" else "data0"
+            data = xor_blocks(self._read_raw(other, index), self._read_raw("parity", index))
+            return data, "reconstructed"
+        return self._read_raw(name, index), "native"
+
     def read_block(self, index: int, disk: str) -> dict[str, Any]:
         self._guard_operational()
         idx = self._validate_index(index)
@@ -355,79 +375,155 @@ class XorArray:
             current1 = self._read_raw("data1", idx)
             new0 = data if name == "data0" else current0
             new1 = data if name == "data1" else current1
-            seq = self._seq + 1
+            result = self._commit_stripe(idx, new0, new1, scenario, operation="write")
+            result.update(
+                {
+                    "disk": name,
+                    "size": len(data),
+                    "data_b64": base64.b64encode(data).decode("ascii"),
+                    "sha256": sha256_hex(data),
+                }
+            )
+            return result
 
-            record = new_record(stripe=idx, seq=seq, data0=new0, data1=new1)
-            try:
-                self.journal.write_prepared(record)
-            except OSError as exc:
-                # No disk block has been touched yet.  A torn header is treated
-                # as "no intent" by recovery, so the striped data stays as-is.
-                raise VolumeCorrupt(
-                    f"could not persist the recovery journal: {exc}",
-                    detail={"stripe": idx, "sequence": seq, "journal": "write_failed"},
-                ) from exc
-            self._seq = seq
+    def clear_stripe(
+        self,
+        index: int,
+        expected_version: int,
+        *,
+        power_loss: str | None = None,
+    ) -> dict[str, Any]:
+        """Zero a whole stripe if — and only if — its version still matches.
 
-            landed: list[str] = []
-            try:
-                if scenario in ("data", "data0", "data1"):
-                    targets = ["data0", "data1"] if scenario == "data" else [scenario]
-                    for disk_name in targets:
-                        self._write_raw(disk_name, idx, new0 if disk_name == "data0" else new1)
-                        landed.append(disk_name)
-                if scenario in ("parity", "both"):
-                    self._write_raw("parity", idx, record.parity)
-                    landed.append("parity")
-                if scenario == "none":
-                    self._write_raw("data0", idx, new0)
-                    self._write_raw("data1", idx, new1)
-                    self._write_raw("parity", idx, record.parity)
-                    landed.extend(("data0", "data1", "parity"))
-                    self.journal.clear(seq)
-                    return {
-                        "index": idx,
-                        "disk": name,
-                        "size": len(data),
-                        "data_b64": base64.b64encode(data).decode("ascii"),
-                        "sha256": sha256_hex(data),
-                        "stripe_sha256": {
-                            "data0": sha256_hex(new0),
-                            "data1": sha256_hex(new1),
-                            "parity": sha256_hex(record.parity),
-                        },
-                        "sequence": seq,
-                        "journal_cleared": True,
-                        "power_loss": "none",
-                        "mode": self.mode,
-                    }
-            except (OSError, VolumeCorrupt) as exc:
-                self.crashed = True
-                message = exc.message if isinstance(exc, VolumeCorrupt) else str(exc)
-                raise VolumeCorrupt(
-                    f"disk write failed and the array was stopped: {message}",
+        This is the archiver's compare-and-swap: the version read together
+        with the data blocks is presented here, and the clear commits only
+        when no write or clear has landed in between.  A clear is journaled
+        exactly like a write of zero blocks, so an interrupted clear converges
+        on restart to either the old or the cleared state — stripe content and
+        version together.
+        """
+
+        self._guard_operational()
+        idx = self._validate_index(index)
+        if self.offline is not None:
+            raise DegradedReadOnly(
+                "the array is in read-only degraded mode because a data disk is offline",
+                detail={"offline_disk": self.offline},
+            )
+        try:
+            scenario = normalize_power_loss(power_loss)
+        except ValueError as exc:
+            raise InvalidConfiguration(str(exc)) from exc
+
+        with self._lock:
+            current_version = self.versions.version(idx)
+            if current_version != expected_version:
+                raise VersionConflict(
+                    "the stripe version does not match; the data was left untouched",
                     detail={
                         "stripe": idx,
-                        "sequence": seq,
-                        "landed": landed,
-                        "journal": "prepared",
-                        "restart_required": True,
+                        "expected_version": expected_version,
+                        "current_version": current_version,
                     },
-                ) from exc
+                )
+            result = self._commit_stripe(
+                idx, ZERO_BLOCK, ZERO_BLOCK, scenario, operation="clear"
+            )
+            result.update({"cleared": True, "previous_version": current_version})
+            return result
 
+    def _commit_stripe(
+        self,
+        idx: int,
+        new0: bytes,
+        new1: bytes,
+        scenario: str,
+        *,
+        operation: str,
+    ) -> dict[str, Any]:
+        """Journaled whole-stripe commit shared by writes and clears.
+
+        The caller must hold ``self._lock``.  The ordering is the crash-safety
+        contract: journal intent -> disk blocks -> stripe version -> journal
+        clear.  Because the version bump lands *before* the journal is
+        cleared, recovery of an interrupted commit replays content and version
+        together, and the version store's per-sequence idempotency keeps the
+        replay from counting the bump twice.
+        """
+
+        seq = self._seq + 1
+        record = new_record(stripe=idx, seq=seq, data0=new0, data1=new1)
+        try:
+            self.journal.write_prepared(record)
+        except OSError as exc:
+            # No disk block has been touched yet.  A torn header is treated
+            # as "no intent" by recovery, so the striped data stays as-is.
+            raise VolumeCorrupt(
+                f"could not persist the recovery journal: {exc}",
+                detail={"stripe": idx, "sequence": seq, "journal": "write_failed"},
+            ) from exc
+        self._seq = seq
+
+        landed: list[str] = []
+        try:
+            if scenario in ("data", "data0", "data1"):
+                targets = ["data0", "data1"] if scenario == "data" else [scenario]
+                for disk_name in targets:
+                    self._write_raw(disk_name, idx, new0 if disk_name == "data0" else new1)
+                    landed.append(disk_name)
+            if scenario in ("parity", "both"):
+                self._write_raw("parity", idx, record.parity)
+                landed.append("parity")
+            if scenario == "none":
+                self._write_raw("data0", idx, new0)
+                self._write_raw("data1", idx, new1)
+                self._write_raw("parity", idx, record.parity)
+                landed.extend(("data0", "data1", "parity"))
+                version = self.versions.apply(idx, seq)
+                self.journal.clear(seq)
+                return {
+                    "index": idx,
+                    "operation": operation,
+                    "version": version,
+                    "stripe_sha256": {
+                        "data0": sha256_hex(new0),
+                        "data1": sha256_hex(new1),
+                        "parity": sha256_hex(record.parity),
+                    },
+                    "sequence": seq,
+                    "journal_cleared": True,
+                    "power_loss": "none",
+                    "mode": self.mode,
+                }
+        except (OSError, VolumeCorrupt) as exc:
             self.crashed = True
-            raise SimulatedPowerLoss(
-                f"simulated power loss after {scenario} blocks landed; restart the "
-                "service to recover",
+            message = exc.message if isinstance(exc, VolumeCorrupt) else str(exc)
+            raise VolumeCorrupt(
+                f"disk write failed and the array was stopped: {message}",
                 detail={
                     "stripe": idx,
                     "sequence": seq,
-                    "scenario": scenario,
+                    "operation": operation,
                     "landed": landed,
                     "journal": "prepared",
                     "restart_required": True,
                 },
-            )
+            ) from exc
+
+        self.crashed = True
+        raise SimulatedPowerLoss(
+            f"simulated power loss after {scenario} blocks landed; restart the "
+            "service to recover",
+            detail={
+                "stripe": idx,
+                "sequence": seq,
+                "operation": operation,
+                "scenario": scenario,
+                "landed": landed,
+                "journal": "prepared",
+                "restart_required": True,
+            },
+        )
 
     # ------------------------------------------------------------ inspection
 
@@ -493,6 +589,72 @@ class XorArray:
                 "include_data": include_data,
             }
 
+    def read_stripe(self, index: int) -> dict[str, Any]:
+        """Read both data blocks of a stripe plus its version in one call.
+
+        This is the archiver's read: the returned version can later be
+        presented to :meth:`clear_stripe` to prove the stripe has not been
+        touched since the data was taken out for archiving.
+        """
+
+        self._guard_operational()
+        idx = self._validate_index(index)
+        with self._lock:
+            blocks: dict[str, dict[str, Any]] = {}
+            raw: dict[str, bytes] = {}
+            for name in DATA_DISKS:
+                data, source = self._read_logical(name, idx)
+                raw[name] = data
+                blocks[name] = {
+                    "size": len(data),
+                    "data_b64": base64.b64encode(data).decode("ascii"),
+                    "sha256": sha256_hex(data),
+                    "source": source,
+                }
+            parity = self._read_raw("parity", idx)
+            zero = (
+                raw["data0"] == ZERO_BLOCK
+                and raw["data1"] == ZERO_BLOCK
+                and parity == ZERO_BLOCK
+            )
+            return {
+                "index": idx,
+                "version": self.versions.version(idx),
+                "mode": self.mode,
+                "offline_disk": self.offline,
+                "consistent": None if self.offline else self._stripe_consistent(idx),
+                "zero": zero,
+                "data0": blocks["data0"],
+                "data1": blocks["data1"],
+            }
+
+    def list_stripes(self) -> dict[str, Any]:
+        """Version and occupancy of every stripe (logical view)."""
+
+        self._guard_operational()
+        with self._lock:
+            versions = self.versions.snapshot()
+            stripes = []
+            for idx in range(self.settings.stripes):
+                data0, _ = self._read_logical("data0", idx)
+                data1, _ = self._read_logical("data1", idx)
+                parity = self._read_raw("parity", idx)
+                stripes.append(
+                    {
+                        "index": idx,
+                        "version": versions[idx],
+                        "zero": data0 == ZERO_BLOCK
+                        and data1 == ZERO_BLOCK
+                        and parity == ZERO_BLOCK,
+                    }
+                )
+            return {
+                "mode": self.mode,
+                "offline_disk": self.offline,
+                "count": len(stripes),
+                "stripes": stripes,
+            }
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             journal_info = self.journal.inspect()
@@ -507,6 +669,7 @@ class XorArray:
                 "disks": list(DISK_NAMES),
                 "sequence": self._seq,
                 "journal": journal_info,
+                "versions": self.versions.info(),
                 "last_recovery": self.last_recovery,
                 "rebuilt_disks": list(self.rebuilt_disks),
             }
